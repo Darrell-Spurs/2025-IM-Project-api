@@ -1,0 +1,5 @@
+test
+*.pyc
+__pycache__/
+.venv
+api/.env
