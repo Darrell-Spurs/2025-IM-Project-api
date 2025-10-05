@@ -11,14 +11,20 @@ from fastapi.responses import StreamingResponse, RedirectResponse
 import string, secrets
 from psycopg2.extras import Json
 
-# small helper to make 8-char id (A–Z a–z 0–9)
+from flask import Flask, request, jsonify, send_file
+
+from db import db_conn  # flat import if you run inside the `api/` dir
+import os
+from PIL import Image
+import io
+
+SCREENSHOTS_DIR = "screenshots"
+
+# helper to make 8-char id (A–Z a–z 0–9)
 _ID_ALPHABET = string.ascii_letters + string.digits
 def _gen_id(n: int = 8) -> str:
     return ''.join(secrets.choice(_ID_ALPHABET) for _ in range(n))
 
-from db import db_conn  # flat import if you run inside the `api/` dir
-
-import os
 
 router = APIRouter(prefix="", tags=["screenshots"])
 
@@ -98,26 +104,27 @@ def _stream_authenticated(bucket: str, object_key: str):
     return client, r
 
 CATEGORY_KEYS: List[str] = [
-    "gaming", "others", "videos", "articles",
-    "messaging", "social_media", "text_editing",
-]
+        "gaming", "others", "videos", "articles",
+        "messaging", "social_media", "text_editing",
+    ]
 def _zero_fill_categories(summary: Dict[str, int]) -> Dict[str, int]:
     # ensure every CATEGORY_KEYS is present, default 0
     out = {k: 0 for k in CATEGORY_KEYS}
     out.update({k: int(v or 0) for k, v in (summary or {}).items()})
     return out
 
+# To be updated
 @router.get("/users/{user_id}/screenshots")
 def list_screenshots_for_user(
-    user_id: str,
-    category: Optional[str] = None,
-    start: Optional[datetime] = Query(None, description="ISO8601 start time (inclusive)"),
-    end: Optional[datetime] = Query(None, description="ISO8601 end time (exclusive)"),
-    limit: int = Query(50, ge=1, le=500),
-    offset: int = Query(0, ge=0),
-    order: str = Query("desc", pattern="^(asc|desc)$"),
-    conn: psycopg2.extensions.connection = Depends(db_conn),
-):
+        user_id: str,
+        category: Optional[str] = None,
+        start: Optional[datetime] = Query(None, description="ISO8601 start time (inclusive)"),
+        end: Optional[datetime] = Query(None, description="ISO8601 end time (exclusive)"),
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+        order: str = Query("desc", pattern="^(asc|desc)$"),
+        conn: psycopg2.extensions.connection = Depends(db_conn),
+    ):
     """
     Returns screenshot metadata for a user, filterable by time range and category.
     Uses capture_time (new schema) and storage-key fields.
@@ -142,11 +149,12 @@ def list_screenshots_for_user(
         rows = cur.fetchall()
     return {"items": [_row_to_dict(r) for r in rows], "count": len(rows)}
 
+# To be updated
 @router.get("/screenshots/{screenshot_id}")
 def get_screenshot_metadata(
-    screenshot_id: str,
-    conn: psycopg2.extensions.connection = Depends(db_conn),
-):
+        screenshot_id: str,
+        conn: psycopg2.extensions.connection = Depends(db_conn),
+    ):
     """
     Return a single screenshot's metadata by its screenshot ID.
     """
@@ -168,12 +176,13 @@ def get_screenshot_metadata(
         raise HTTPException(status_code=404, detail="Screenshot not found.")
     return _row_to_dict(row)
 
+# To be updated
 @router.get("/screenshots/{screenshot_id}/download")
 def download_screenshot(
-    screenshot_id: str,
-    expires_in: int = Query(300, ge=30, le=3600),
-    conn: psycopg2.extensions.connection = Depends(db_conn),
-):
+        screenshot_id: str,
+        expires_in: int = Query(300, ge=30, le=3600),
+        conn: psycopg2.extensions.connection = Depends(db_conn),
+    ):
     """
     Return a redirect to a short-lived signed URL for the screenshot in Supabase Storage.
     """
@@ -186,16 +195,17 @@ def download_screenshot(
     url = _sign_url(bucket, object_key, expires_in)
     return RedirectResponse(url, status_code=307)
 
+# To be updated
 @router.get("/users/{user_id}/screenshots/within")
 def list_screenshots_within_hours(
-    user_id: str,
-    hours: int = Query(6, ge=1, le=24*365*100, description="Look back hours"),
-    category: Optional[str] = Query(None),
-    limit: int = Query(100, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-    order: str = Query("desc", pattern="^(asc|desc)$"),
-    conn: psycopg2.extensions.connection = Depends(db_conn),
-):
+        user_id: str,
+        hours: int = Query(6, ge=1, le=24*365*100, description="Look back hours"),
+        category: Optional[str] = Query(None),
+        limit: int = Query(100, ge=1, le=1000),
+        offset: int = Query(0, ge=0),
+        order: str = Query("desc", pattern="^(asc|desc)$"),
+        conn: psycopg2.extensions.connection = Depends(db_conn),
+    ):
     """
     Recent screenshots for a user (uses capture_time).
     """
@@ -221,11 +231,11 @@ def list_screenshots_within_hours(
 
 @router.get("/users/{user_id}/screenshots/within/summary")
 def list_screenshots_within_hours_summary(
-    user_id: str,
-    hours: int = Query(6, ge=1, le=24*365*100, description="Look back hours"),
-    record_seconds: int = Query(10, ge=1, le=300, description="Seconds per record"),
-    conn: psycopg2.extensions.connection = Depends(db_conn),
-):
+        user_id: str,
+        hours: int = Query(6, ge=1, le=24*365*100, description="Look back hours"),
+        record_seconds: int = Query(10, ge=1, le=300, description="Seconds per record"),
+        conn: psycopg2.extensions.connection = Depends(db_conn),
+    ):
     """
     Returns a dict: {category: total_seconds, ...} for the last X hours.
     Each record in `screenshots` is treated as `record_seconds`.
@@ -242,43 +252,114 @@ def list_screenshots_within_hours_summary(
         cur.execute(sql, (user_id, start_dt))
         rows = cur.fetchall()
     result = _zero_fill_categories({row[0]: row[1] for row in rows})
-    return {k: v * record_seconds for k, v in result.items()}
-
-router.get("/users/{user_id}/summary/{day}",
-            summary="Get per-category summary for a specific date",
-            description="Returns minutes per category for the given user on the given date (YYYY-MM-DD). Missing categories are returned with 0.")
-def get_daily_summary(
-    user_id: str,
-    day: str,  # expects YYYY-MM-DD
-    conn: psycopg2.extensions.connection = Depends(db_conn),
-):
-    # Parse date (and validate)
-    try:
-        d = _date.fromisoformat(day)  # raises ValueError if invalid
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid date format (expected YYYY-MM-DD)")
-
-    # Aggregate by category for that date
-    sql = """
-        SELECT category, COUNT(*)::int AS minutes
-          FROM logs
-         WHERE user_id = %s
-           AND day = %s::date
-         GROUP BY category
-    """
-    per_cat: Dict[str, int] = {}
-    with conn.cursor() as cur:
-        cur.execute(sql, (user_id, d.isoformat()))
-        for cat, mins in cur.fetchall():
-            per_cat[cat] = int(mins or 0)
-
-    # Ensure all categories exist with 0 default
+    result = {k: v * record_seconds for k, v in result.items()}
     return {
         "user_id": user_id,
-        "date": d.isoformat(),
-        "summary": _zero_fill_categories(per_cat),
+        "lookback_hours": hours,
+        "summary": result,
     }
 
+@router.get("/users/{user_id}/screenshots/category-summary-by-range",
+            summary="Get category usage summary with configurable time granularity",
+            description="Returns seconds spent in each category between start and end times, grouped by time granularity.")
+def get_category_summary_by_range(
+        user_id: str,
+        start: datetime = Query(..., description="Start time (inclusive)"),
+        end: datetime = Query(..., description="End time (exclusive)"),
+        granularity: str = Query(None, description="Time granularity: hour, day, week, month, year. If none, treats whole period as one."),
+        category: Optional[str] = Query(None, description="Optional: filter to specific category"),
+        record_seconds: int = Query(10, ge=1, le=300, description="Seconds per record"),
+        conn: psycopg2.extensions.connection = Depends(db_conn),
+    ):
+    # Ensure timestamps are UTC
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+
+    # Validate granularity
+    valid_granularities = {'hour', 'day', 'week', 'month', 'year'}
+    if granularity and granularity not in valid_granularities:
+        raise HTTPException(400, f"Invalid granularity. Must be one of: {', '.join(valid_granularities)}")
+    
+    result = {}
+    if granularity:
+        current = start
+        while current < end:
+            period_key = current.isoformat()
+            result[period_key] = _zero_fill_categories({})
+            
+            # Increment based on granularity
+            if granularity == 'hour':
+                current += timedelta(hours=1)
+            elif granularity == 'day':
+                current += timedelta(days=1)
+            elif granularity == 'week':
+                current += timedelta(weeks=1)
+            elif granularity == 'month':
+                # Handle month increment
+                if current.month == 12:
+                    current = current.replace(year=current.year + 1, month=1)
+                else:
+                    current = current.replace(month=current.month + 1)
+            elif granularity == 'year':
+                current = current.replace(year=current.year + 1)
+    else:
+        # No granularity - just one period
+        result[start.isoformat()] = _zero_fill_categories({})
+
+    # SQL with date_trunc if granularity specified
+    if granularity:
+        sql = """
+            SELECT 
+                date_trunc(%s, capture_time) as period_start,
+                category,
+                COUNT(*)::int AS count
+            FROM screenshots
+            WHERE user_id = %s
+              AND capture_time >= %s
+              AND capture_time < %s
+              AND (%s IS NULL OR category = %s)
+            GROUP BY period_start, category
+            ORDER BY period_start
+        """
+        params = (granularity, user_id, start, end, category, category)
+    else:
+        # No granularity - treat whole period as one
+        sql = """
+            SELECT 
+                %s as period_start,
+                category,
+                COUNT(*)::int AS count
+            FROM screenshots
+            WHERE user_id = %s
+              AND capture_time >= %s
+              AND capture_time < %s
+              AND (%s IS NULL OR category = %s)
+            GROUP BY category
+        """
+        params = (start, user_id, start, end, category, category)
+
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+
+    # Fill in actual data where it exists
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        for period_start, cat, count in cur.fetchall():
+            period_key = period_start.isoformat()
+            result[period_key][cat] = count * record_seconds
+
+    return {
+        "user_id": user_id,
+        "start_time": start.isoformat(),
+        "end_time": end.isoformat(),
+        "granularity": granularity,
+        "periods": result
+    }
+
+# To be updated
 @router.get("/users/{user_id}/screenshots.zip")
 def download_screenshots_zip(
     user_id: str,
@@ -287,7 +368,7 @@ def download_screenshots_zip(
     end: Optional[datetime] = None,
     max_screenshots: int = Query(200, ge=1, le=2000),
     conn: psycopg2.extensions.connection = Depends(db_conn),
-):
+    ):
     """
     Bundle matched screenshots into a ZIP by streaming from Supabase Storage (authenticated).
     """
@@ -331,8 +412,7 @@ def download_screenshots_zip(
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
-
-
+# To be updated
 @router.post(
     "/users/{user_id}/screenshots/test-generate",
     summary="Generate placeholder screenshots (test data)",
@@ -341,14 +421,14 @@ def download_screenshots_zip(
         "spaced 10 seconds apart starting from `start`. "
         "Only `user_id`, `category`, `start`, and `count` are variable; all storage fields are fixed."
     ),
-)
+    )
 def generate_test_screenshots(
-    user_id: str,
-    category: str = Query(..., min_length=1, description="Category to assign to all generated screenshots."),
-    start: Optional[datetime] = Query(None, description="Start time (UTC). Defaults to now if omitted."),
-    count: int = Query(10, ge=1, le=1000, description="How many screenshots to create."),
-    conn: psycopg2.extensions.connection = Depends(db_conn),
-):
+        user_id: str,
+        category: str = Query(..., min_length=1, description="Category to assign to all generated screenshots."),
+        start: Optional[datetime] = Query(None, description="Start time (UTC). Defaults to now if omitted."),
+        count: int = Query(10, ge=1, le=1000, description="How many screenshots to create."),
+        conn: psycopg2.extensions.connection = Depends(db_conn),
+    ):
     """
     Generates `count` screenshots at 10s intervals using a fixed placeholder asset.
     Variable fields: user_id, category, capture_time, created_at.
@@ -436,3 +516,68 @@ def generate_test_screenshots(
         "first_capture_time": created[0][1].isoformat() if created else None,
         "last_capture_time": created[-1][1].isoformat() if created else None,
     }
+
+
+@router.route('/screenshots/upload-screenshot', methods=['POST'])
+def upload_screenshot():
+    try:
+        # Get form data
+        screenshot_id = request.form.get('screenshot_id')
+        user_id = request.form.get('user_id')
+        category = request.form.get('category')
+        target_format = request.form.get('format', 'png')
+        
+        # Get uploaded file
+        if 'screenshot' not in request.files:
+            return jsonify({'error': 'No file uploaded'}), 400
+        
+        file = request.files['screenshot']
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        # Generate filename
+        filename = f"screenshot_{screenshot_id}.{target_format}"
+        file_path = os.path.join(SCREENSHOTS_DIR, filename)
+        
+        # Process and save the file
+        image = Image.open(io.BytesIO(file.read()))
+        
+        if target_format == 'webp':
+            image.save(file_path, 'WEBP', quality=85, optimize=True)
+        else:
+            image.save(file_path, 'PNG', optimize=True)
+        
+        # Get file size
+        file_size = os.path.getsize(file_path)
+        
+        return jsonify({
+            'success': True,
+            'file_path': file_path,
+            'file_url': f'/api/screenshots/{screenshot_id}',
+            'file_size': file_size
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@router.route('/screenshots/<screenshot_id>')
+def get_screenshot(screenshot_id):
+    """Serve screenshot files via API endpoint"""
+    # Try WebP first
+    webp_path = os.path.join(SCREENSHOTS_DIR, f"screenshot_{screenshot_id}.webp")
+    png_path = os.path.join(SCREENSHOTS_DIR, f"screenshot_{screenshot_id}.png")
+    
+    if os.path.exists(webp_path):
+        return send_file(webp_path, mimetype='image/webp')
+    elif os.path.exists(png_path):
+        return send_file(png_path, mimetype='image/png')
+    else:
+        return jsonify({'error': 'Screenshot not found'}), 404
+
+@router.route('/screenshots/<filename>')
+def serve_screenshot(filename):
+    """Serve screenshots as static files"""
+    file_path = os.path.join(SCREENSHOTS_DIR, filename)
+    if os.path.exists(file_path):
+        return send_file(file_path)
+    return jsonify({'error': 'File not found'}), 404
