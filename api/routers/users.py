@@ -93,11 +93,11 @@ class ThresholdsPatch(BaseModel):
             description="Retrieves a user by their unique ID.")
 def get_user(user_id: str, conn: psycopg2.extensions.connection = Depends(db_conn)):
     with conn.cursor() as cur:
-        cur.execute("SELECT id, name, status, created_at, email_address FROM users WHERE id = %s", (user_id,))
+        cur.execute("SELECT id, name, status, created_at, email_address, is_admin FROM users WHERE id = %s", (user_id,))
         r = cur.fetchone()
         if not r:
             raise HTTPException(status_code=404, detail="User not found")
-        return {"id": r[0], "name": r[1], "status": r[2], "created_at": r[3].isoformat(), "email_address": r[4]}
+        return {"id": r[0], "name": r[1], "status": r[2], "created_at": r[3].isoformat(), "email_address": r[4], "is_admin": r[5]}
 
 @router.post("/users", status_code=status.HTTP_201_CREATED,
              summary="Create a new user",
@@ -106,9 +106,9 @@ def get_user(user_id: str, conn: psycopg2.extensions.connection = Depends(db_con
                           "Thresholds are dict-of-arrays and default to empty arrays."))
 def create_user(payload: CreateUser, conn: psycopg2.extensions.connection = Depends(db_conn)):
     sql = """
-        INSERT INTO users (id, name, password, status, threshold, email_address, is_admin)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        RETURNING id, name, status, created_at, threshold, email_address, is_admin
+        INSERT INTO users (id, name, password, status, threshold, email_address, is_admin, invite_code)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id, name, status, created_at, threshold, email_address, is_admin, invite_code
     """
     # ensure all categories exist as arrays; merge any provided keys
     merged = default_thresholds()
@@ -119,9 +119,13 @@ def create_user(payload: CreateUser, conn: psycopg2.extensions.connection = Depe
 
     for _ in range(5):
         new_id = generate_id(8)
+        if not payload.is_admin:
+            new_invite_code = generate_id(6)
+        else:
+            new_invite_code = None
         try:
             with conn.cursor() as cur:
-                cur.execute(sql, (new_id, payload.name, pw_hash, payload.status, Json(merged), payload.email_address, payload.is_admin))
+                cur.execute(sql, (new_id, payload.name, pw_hash, payload.status, Json(merged), payload.email_address, payload.is_admin, new_invite_code))
                 row = cur.fetchone()
             conn.commit()
             return {
@@ -132,6 +136,7 @@ def create_user(payload: CreateUser, conn: psycopg2.extensions.connection = Depe
                 "threshold": row[4] or default_thresholds(),
                 "email_address": row[5],
                 "is_admin": row[6],
+                "invite_code": row[7],
             }
         except psycopg2.errors.UniqueViolation:
             conn.rollback()
