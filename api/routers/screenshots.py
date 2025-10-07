@@ -2,23 +2,22 @@ from datetime import datetime, timedelta, timezone, date as _date
 from io import BytesIO
 from typing import Optional, List, Dict
 from urllib.parse import quote
+import hashlib
 
 import httpx
 import psycopg2
-from fastapi import APIRouter, Query, HTTPException, Depends, Body
-from fastapi.responses import StreamingResponse, RedirectResponse
+from fastapi import APIRouter, Query, HTTPException, Depends, Body, File, UploadFile, Form
+from fastapi.responses import StreamingResponse, RedirectResponse, FileResponse
 
 import string, secrets
 from psycopg2.extras import Json
-
-from flask import Flask, request, jsonify, send_file
 
 from db import db_conn  # flat import if you run inside the `api/` dir
 import os
 from PIL import Image
 import io
 
-SCREENSHOTS_DIR = "screenshots"
+SCREENSHOTS_DIR = "../screenshots"
 
 # helper to make 8-char id (A–Z a–z 0–9)
 _ID_ALPHABET = string.ascii_letters + string.digits
@@ -518,66 +517,134 @@ def generate_test_screenshots(
     }
 
 
-@router.route('/screenshots/upload-screenshot', methods=['POST'])
-def upload_screenshot():
+@router.post("/screenshots/upload-screenshot")
+async def upload_screenshot(
+        screenshot_id: str = Form(...),
+        user_id: str = Form(...),
+        category: str = Form(...),
+        file: UploadFile = File(...),
+        conn: psycopg2.extensions.connection = Depends(db_conn),
+    ):
+    """
+    Upload a screenshot to local storage and save metadata to database.
+    All screenshots are saved as PNG format for optimal quality.
+    """
     try:
-        # Get form data
-        screenshot_id = request.form.get('screenshot_id')
-        user_id = request.form.get('user_id')
-        category = request.form.get('category')
-        target_format = request.form.get('format', 'png')
+        # Validate file type
+        if not file.content_type or not file.content_type.startswith('image/'):
+            raise HTTPException(status_code=400, detail="File must be an image")
         
-        # Get uploaded file
-        if 'screenshot' not in request.files:
-            return jsonify({'error': 'No file uploaded'}), 400
+        # Read and validate file size (max 10MB)
+        file_content = await file.read()
+        if len(file_content) > 10 * 1024 * 1024:  # 10MB
+            raise HTTPException(status_code=400, detail="File too large (max 10MB)")
         
-        file = request.files['screenshot']
-        if file.filename == '':
-            return jsonify({'error': 'No file selected'}), 400
-        
-        # Generate filename
-        filename = f"screenshot_{screenshot_id}.{target_format}"
+        # Generate filename with sanitized screenshot_id (always PNG)
+        safe_id = "".join(c for c in screenshot_id if c.isalnum() or c in "_-")
+        filename = f"screenshot_{safe_id}.png"
         file_path = os.path.join(SCREENSHOTS_DIR, filename)
         
-        # Process and save the file
-        image = Image.open(io.BytesIO(file.read()))
+        # Process and save the file as PNG
+        image = Image.open(io.BytesIO(file_content))
+        width, height = image.size
         
-        if target_format == 'webp':
-            image.save(file_path, 'WEBP', quality=85, optimize=True)
-        else:
-            image.save(file_path, 'PNG', optimize=True)
+        # Save as PNG (lossless, universal compatibility)
+        image.save(file_path, 'PNG', optimize=True)
+        mime_type = 'image/png'
         
         # Get file size
         file_size = os.path.getsize(file_path)
         
-        return jsonify({
-            'success': True,
-            'file_path': file_path,
-            'file_url': f'/api/screenshots/{screenshot_id}',
-            'file_size': file_size
-        })
+        # Calculate SHA256 hash
+        with open(file_path, 'rb') as f:
+            sha256_hash = hashlib.sha256(f.read()).hexdigest()
         
+        # Save metadata to database
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO screenshots (
+                    id, user_id, category, capture_time,
+                    storage_provider, bucket, object_key,
+                    sha256, mime, bytes, width, height,
+                    extra, created_at
+                ) VALUES (
+                    %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s
+                )
+            """, (
+                screenshot_id,
+                user_id,
+                category,
+                datetime.now(timezone.utc),  # capture_time
+                'local',  # storage_provider
+                None,  # bucket (not used for local storage)
+                filename,  # object_key (relative path)
+                sha256_hash,
+                mime_type,
+                file_size,
+                width,
+                height,
+                Json({}),  # extra metadata
+                datetime.now(timezone.utc)  # created_at
+            ))
+            conn.commit()
+        
+        return {
+            'success': True,
+            'screenshot_id': screenshot_id,
+            'file_path': filename,
+            'file_size': file_size,
+            'width': width,
+            'height': height,
+            'mime_type': mime_type,
+            'format': 'png'
+        }
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
-@router.route('/screenshots/<screenshot_id>')
-def get_screenshot(screenshot_id):
-    """Serve screenshot files via API endpoint"""
-    # Try WebP first
-    webp_path = os.path.join(SCREENSHOTS_DIR, f"screenshot_{screenshot_id}.webp")
-    png_path = os.path.join(SCREENSHOTS_DIR, f"screenshot_{screenshot_id}.png")
+@router.get("/screenshots/{screenshot_id}/file")
+async def get_screenshot_file(
+        screenshot_id: str,
+        conn: psycopg2.extensions.connection = Depends(db_conn),
+    ):
+    """
+    Serve screenshot file by screenshot ID with database validation.
+    """
+    # Get screenshot metadata from database
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT storage_provider, object_key, mime, user_id
+            FROM screenshots 
+            WHERE id = %s
+        """, (screenshot_id,))
+        row = cur.fetchone()
     
-    if os.path.exists(webp_path):
-        return send_file(webp_path, mimetype='image/webp')
-    elif os.path.exists(png_path):
-        return send_file(png_path, mimetype='image/png')
-    else:
-        return jsonify({'error': 'Screenshot not found'}), 404
+    if not row:
+        raise HTTPException(status_code=404, detail="Screenshot not found")
+    
+    storage_provider, object_key, mime_type, user_id = row
+    
+    # Only serve local storage files
+    if storage_provider != 'local':
+        raise HTTPException(status_code=400, detail="Screenshot not stored locally")
+    
+    # Build file path
+    file_path = os.path.join(SCREENSHOTS_DIR, object_key)
+    
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Screenshot file not found on disk")
+    
+    return FileResponse(
+        path=file_path,
+        media_type=mime_type,
+        filename=object_key
+    )
 
-@router.route('/screenshots/<filename>')
-def serve_screenshot(filename):
-    """Serve screenshots as static files"""
-    file_path = os.path.join(SCREENSHOTS_DIR, filename)
-    if os.path.exists(file_path):
-        return send_file(file_path)
-    return jsonify({'error': 'File not found'}), 404
+# Removed unsafe direct file serving endpoint for security reasons
+# Use /screenshots/{screenshot_id}/file instead which validates through database
